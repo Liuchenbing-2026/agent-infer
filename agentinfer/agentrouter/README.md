@@ -91,3 +91,31 @@ patch onto a `#251`+ revision if needed).
 
 - Vendoring or shipping the full Router / `agentrouter/` binary tree in this repo
 - WASM implementation of `agent_hint_token_offsets`
+
+## Segment token cache reference core
+
+`segment_cache.py` is an isolated Python reference core, not native Router
+middleware wiring. A successful four-message startup probe only establishes
+sample compatibility. Before accepting a prefix hit, the core renders the
+complete current request, checks that the cached token IDs remain its prefix,
+and checks the reconstructed suffix against the complete result. Incompatible
+headers, footers or contextual message rendering fall back to that full result;
+`render_mismatches_total` counts such rejected candidates.
+
+The current renderer callback already returns token IDs. This conservative
+validation therefore performs full tokenization on every non-exact request;
+prefix-hit and reused-token counters are **not** saved-tokenization measurements.
+Exact hits still avoid rendering. Keep renderer configuration deterministic and
+include model/template revisions and render options in the cache envelope, or
+create a fresh cache when they change.
+
+Focused checks, in the repository development environment:
+
+```bash
+python -m pytest tests/agentrouter/test_segment_cache.py
+python -m pytest tests/agentrouter/test_segment_cache_render_guard.py
+```
+
+These cover the Python cache core, including context changes first appearing at
+the fifth message. They do not validate native middleware, model generation,
+KV reuse, NPU execution or performance.

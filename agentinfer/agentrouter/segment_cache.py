@@ -5,16 +5,17 @@
 This module implements the reusable core of the
 "added-token 切分 + 启动 probe + 不命中即回退" design for agent requests:
 
-* a one-shot :func:`evaluate_probe` that decides whether the renderer is
-  "message-concatenable", i.e. a longer conversation's token sequence has
-  the shorter conversation's token sequence as a prefix;
-* a :class:`SegmentTokenCache` that, on a message-boundary prefix hit, only
-  tokenizes the added-token tail (``anchor + new messages`` minus the
-  anchor) and concatenates it onto the cached prefix;
+* a one-shot :func:`evaluate_probe` that screens candidate renderers for
+  message concatenation on the supplied samples;
+* a :class:`SegmentTokenCache` that validates each candidate prefix and
+  reconstructed sequence against the current complete render. A finite
+  startup probe cannot establish concatenability for unseen conversations;
 * fail-open fallback: any precondition that does not hold (probe not ready,
   prefix miss, tail render error, anchor mismatch, multimodal content,
   disallowed flags, over-long conversation) returns the plain full-render
-  result, so the cache can only make the tail slower, never wrong.
+  result. Exact hits still avoid rendering. Prefix validation with the
+  token-ID-only RenderFn requires complete tokenization, so prefix-hit and
+  reused-token counters do not imply avoided tokenization work.
 
 The module is deliberately free of global mutable state, environment
 variables and magic numbers so that it can be reviewed and unit-tested in
@@ -109,6 +110,7 @@ class SegmentCacheStats:
     tail_errors: int = 0
     reused_tokens: int = 0
     added_tokens: int = 0
+    render_mismatches: int = 0
 
     def snapshot(self) -> dict[str, int]:
         return {
@@ -116,6 +118,7 @@ class SegmentCacheStats:
             "prefix_hits_total": self.prefix_hits,
             "misses_total": self.misses,
             "tail_errors_total": self.tail_errors,
+            "render_mismatches_total": self.render_mismatches,
             "reused_tokens_total": self.reused_tokens,
             "added_tokens_total": self.added_tokens,
         }
@@ -156,8 +159,9 @@ def evaluate_probe(
     3. ``tokens([a, b, c, d])[len(head):] == tokens([anchor, c, d])[len(anchor):]``
        -- a message renders identically inside and outside of context.
 
-    Any failure yields :data:`ProbeState.DISABLED`; the caller then stays on
-    the full-render path forever.
+    Any failure yields :data:`ProbeState.DISABLED`, disabling prefix reuse.
+    READY is only a sample-based eligibility check, not a guarantee for other
+    requests; each prefix candidate must also match the current full render.
     """
 
     if len(sample_messages) < 4:
@@ -188,6 +192,10 @@ class SegmentTokenCache:
     ``render`` maps a sequence of messages to their token ids. The cache is
     keyed by ``hash(envelope || m1 || ... || mk)`` so it is per-message-prefix
     and per-envelope (different sessions never collide).
+
+    The renderer and its configuration must remain deterministic for a cache
+    instance; include model/template revisions and render options in the
+    envelope, or create a fresh cache when they change.
     """
 
     render: RenderFn
@@ -211,14 +219,14 @@ class SegmentTokenCache:
             self._cache.move_to_end(full_key)
             return list(cached)
 
+        result = list(self.render(message_list))
         if self._prefix_enabled(envelope, message_list):
-            segmented = self._try_segment(envelope, message_list)
+            segmented = self._try_segment(envelope, message_list, result)
             if segmented is not None:
                 self._store(full_key, tuple(segmented))
                 return segmented
 
         self.stats.misses += 1
-        result = list(self.render(message_list))
         self._store(full_key, tuple(result))
         return result
 
@@ -246,12 +254,17 @@ class SegmentTokenCache:
             return False
         return True
 
-    def _try_segment(self, envelope: Mapping[str, Any], messages: Sequence[Message]) -> list[int] | None:
+    def _try_segment(
+        self, envelope: Mapping[str, Any], messages: Sequence[Message], full_tokens: Sequence[int]
+    ) -> list[int] | None:
         anchor_tokens = self.probe.anchor_tokens
         for split in range(len(messages) - 1, 0, -1):
             prefix = self._cache.get(self._key(envelope, messages[:split]))
             if prefix is None:
                 continue
+            if not _is_prefix(prefix, full_tokens):
+                self.stats.render_mismatches += 1
+                return None
             try:
                 tail = tuple(self.render([self.anchor_message, *messages[split:]]))
             except Exception:  # noqa: BLE001 - fail-open on any renderer error
@@ -261,6 +274,9 @@ class SegmentTokenCache:
                 self.stats.tail_errors += 1
                 return None
             added = tail[len(anchor_tokens) :]
+            if tuple(full_tokens[len(prefix) :]) != added:
+                self.stats.render_mismatches += 1
+                return None
             self.stats.prefix_hits += 1
             self.stats.reused_tokens += len(prefix)
             self.stats.added_tokens += len(added)
